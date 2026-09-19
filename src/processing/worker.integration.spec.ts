@@ -20,23 +20,44 @@ interface Interval {
   patientId: string;
   start: number;
   end: number;
+  ok: boolean;
 }
 
-/** Records when each event was in the external call, for the overlap check. */
+/**
+ * Records when each event was in the external call, for the overlap and
+ * order checks, and fails the calls it is told to.
+ */
 class RecordingProcessor implements EventProcessor {
   intervals: Interval[] = [];
+  /** Decides per call; `nth` is 1 for the first call for that event. */
+  failWhen: (event: EventDoc, nth: number) => boolean = () => false;
+  private readonly calls = new Map<string, number>();
+
   constructor(private readonly delayMs: number) {}
 
   async process(event: EventDoc): Promise<unknown> {
+    const nth = (this.calls.get(event._id) ?? 0) + 1;
+    this.calls.set(event._id, nth);
     const start = performance.now();
     await new Promise((resolve) => setTimeout(resolve, this.delayMs));
+    const ok = !this.failWhen(event, nth);
     this.intervals.push({
       id: event._id,
       patientId: event.patientId,
       start,
       end: performance.now(),
+      ok,
     });
+    if (!ok) throw new Error(`simulated failure, call ${nth}`);
     return { eventId: event._id };
+  }
+
+  /** Ids in the order the external call saw them, failures included. */
+  sequence(patientId: string): string[] {
+    return this.intervals
+      .filter((r) => r.patientId === patientId)
+      .sort((a, b) => a.start - b.start)
+      .map((r) => r.id);
   }
 }
 
@@ -73,6 +94,9 @@ describe('WorkerService against MongoDB', () => {
     LEASE_TTL_MS: 5_000,
     POLL_IDLE_MS: 5,
     SHUTDOWN_GRACE_MS: 2_000,
+    MAX_ATTEMPTS: 3,
+    RETRY_BASE_MS: 30,
+    RETRY_MAX_MS: 30,
   };
 
   async function worker(
@@ -133,6 +157,25 @@ describe('WorkerService against MongoDB', () => {
       await sleep(10);
     }
     throw new Error('events did not all complete');
+  }
+
+  /** Waits until `patientId` has `n` events in a terminal status. */
+  async function untilSettled(patientId: string, n: number): Promise<void> {
+    const col = client.db().collection<EventDoc>('events');
+    for (let i = 0; i < 400; i += 1) {
+      const settled = await col.countDocuments({
+        patientId,
+        status: { $in: ['done', 'failed'] },
+      });
+      if (settled >= n) return;
+      await sleep(10);
+    }
+    const docs = await col.find({ patientId }).sort({ ts: 1 }).toArray();
+    throw new Error(
+      `patient ${patientId} did not settle: ${docs
+        .map((d) => `${d._id}:${d.status}/${d.attempts}`)
+        .join(' ')}`,
+    );
   }
 
   it('two workers never process one patient concurrently, and apply its events in ts order', async () => {
@@ -242,6 +285,71 @@ describe('WorkerService against MongoDB', () => {
     });
   });
 
+  it('keeps ts order across retries: a failed attempt holds the line until it succeeds', async () => {
+    // Every odd event fails its first call, with two workers competing.
+    processor.failWhen = (event, nth) =>
+      nth === 1 && (event.data as { i: number }).i % 2 === 1;
+    for (const i of [5, 1, 7, 3, 0, 6, 2, 4]) await insert('p5', i);
+
+    const [w1, w2] = [await worker(), await worker()];
+    w1.onApplicationBootstrap();
+    w2.onApplicationBootstrap();
+    await untilSettled('p5', 8);
+    await Promise.all([
+      w1.beforeApplicationShutdown(),
+      w2.beforeApplicationShutdown(),
+    ]);
+    processor.failWhen = () => false;
+
+    // The call sequence never goes backwards: a retry repeats an id, it
+    // never lets a later id in first.
+    const seq = processor.sequence('p5');
+    expect(seq).toHaveLength(12);
+    for (let i = 1; i < seq.length; i += 1) {
+      expect(seq[i]! >= seq[i - 1]!).toBe(true);
+    }
+    const docs = await client
+      .db()
+      .collection<EventDoc>('events')
+      .find({ patientId: 'p5' })
+      .sort({ ts: 1 })
+      .toArray();
+    expect(docs.map((d) => d.attempts)).toEqual([1, 2, 1, 2, 1, 2, 1, 2]);
+    expect(docs.every((d) => d.status === 'done' && !d.outOfOrder)).toBe(true);
+    // The retry history survives the eventual success.
+    expect(docs[1]?.error).toMatch(/simulated failure/);
+  });
+
+  it('marks a poison event failed after MAX_ATTEMPTS and lets the patient continue', async () => {
+    processor.failWhen = (event) => event._id === 'p6-00';
+    for (const i of [2, 0, 1]) await insert('p6', i);
+
+    const w = await worker();
+    w.onApplicationBootstrap();
+    await untilSettled('p6', 3);
+    await w.beforeApplicationShutdown();
+    processor.failWhen = () => false;
+
+    expect(await events.findById('p6-00')).toMatchObject({
+      status: 'failed',
+      attempts: 3,
+      error: expect.stringMatching(/simulated failure/) as string,
+    });
+    // Later events waited for every attempt, then went through in order.
+    expect(processor.sequence('p6')).toEqual([
+      'p6-00',
+      'p6-00',
+      'p6-00',
+      'p6-01',
+      'p6-02',
+    ]);
+    expect(await events.findById('p6-02')).toMatchObject({
+      status: 'done',
+      attempts: 1,
+      outOfOrder: false,
+    });
+  });
+
   it('fences out a stalled attempt after another worker took over its expired lock', async () => {
     let release!: () => void;
     const gate = new Promise<void>((r) => {
@@ -265,7 +373,7 @@ describe('WorkerService against MongoDB', () => {
     // A's lock and lease expire 300ms after its claim; B takes over.
     const wB = await worker(processor, shortLease);
     wB.onApplicationBootstrap();
-    await untilAllDone(19);
+    await untilSettled('p4', 1);
 
     // A wakes up late and tries to write its outcome with a stale token.
     release();
