@@ -4,7 +4,7 @@ import {
   type MongoMemory,
 } from '../../test/support/mongo-memory';
 import { createMongoClient } from '../mongo/mongo-client';
-import type { EventDoc } from './event.types';
+import type { ClaimedEvent, EventDoc } from './event.types';
 import { EventsRepository } from './events.repository';
 
 describe('EventsRepository', () => {
@@ -47,6 +47,16 @@ describe('EventsRepository', () => {
 
   const stored = (id: string): Promise<EventDoc | null> =>
     client.db().collection<EventDoc>('events').findOne({ _id: id });
+
+  /** claimHead, unwrapped: the event, or null when nothing was claimed. */
+  const head = async (
+    patientId: string,
+    workerId: string,
+    now: Date,
+  ): Promise<ClaimedEvent | null> => {
+    const claim = await repo.claimHead(patientId, workerId, 30_000, now);
+    return claim.kind === 'claimed' ? claim.event : null;
+  };
 
   describe('insertIfAbsent', () => {
     it('creates the document on first insert', async () => {
@@ -109,7 +119,7 @@ describe('EventsRepository', () => {
         event({ _id: 'earlier', ts: at(10), receivedAt: at(2) }),
       );
 
-      const claimed = await repo.claimHead('p1', 'w1', 30_000, at(10));
+      const claimed = await head('p1', 'w1', at(10));
 
       expect(claimed).toMatchObject({
         _id: 'earlier',
@@ -129,26 +139,76 @@ describe('EventsRepository', () => {
         event({ _id: 'first', ts: T0, receivedAt: at(1) }),
       );
 
-      expect(await repo.claimHead('p1', 'w1', 30_000, at(10))).toMatchObject({
-        _id: 'first',
-      });
+      expect(await head('p1', 'w1', at(10))).toMatchObject({ _id: 'first' });
     });
 
     it('only touches the named patient', async () => {
       await repo.insertIfAbsent(event({ _id: 'other', patientId: 'p2' }));
-      expect(await repo.claimHead('p1', 'w1', 30_000, at(10))).toBeNull();
+      expect(await repo.claimHead('p1', 'w1', 30_000, at(10))).toEqual({
+        kind: 'empty',
+      });
     });
 
-    it('leaves events whose notBefore has not arrived', async () => {
+    it('reports a head still inside its grace window as blocked', async () => {
       await repo.insertIfAbsent(event({ notBefore: at(3) }));
-      expect(await repo.claimHead('p1', 'w1', 30_000, at(2))).toBeNull();
+      expect(await repo.claimHead('p1', 'w1', 30_000, at(2))).toEqual({
+        kind: 'blocked',
+        until: at(3),
+      });
+    });
+
+    it('holds the line: a ready later event waits behind an unready earlier one', async () => {
+      await repo.insertIfAbsent(
+        event({ _id: 'earlier', ts: at(10), notBefore: at(50) }),
+      );
+      await repo.insertIfAbsent(
+        event({ _id: 'later', ts: at(20), notBefore: at(1) }),
+      );
+
+      expect(await repo.claimHead('p1', 'w1', 30_000, at(10))).toEqual({
+        kind: 'blocked',
+        until: at(50),
+      });
+    });
+
+    it('waits behind an event whose lock is still live', async () => {
+      await repo.insertIfAbsent(event({ _id: 'held', ts: at(10) }));
+      await head('p1', 'w1', at(10)); // locked until at(40)
+      await repo.insertIfAbsent(event({ _id: 'next', ts: at(20) }));
+
+      expect(await repo.claimHead('p1', 'w2', 30_000, at(20))).toEqual({
+        kind: 'blocked',
+        until: at(40),
+      });
+    });
+
+    it('reclaims an event whose lock has expired, with a fresh token and one more attempt', async () => {
+      await repo.insertIfAbsent(event());
+      const first = await head('p1', 'w1', at(10));
+
+      const second = await head('p1', 'w2', at(41));
+
+      expect(second).toMatchObject({
+        _id: first!._id,
+        status: 'processing',
+        lockedBy: 'w2',
+        attempts: 2,
+      });
+      expect(second!.lockToken).not.toBe(first!.lockToken);
+      // The first attempt's token is now stale.
+      expect(
+        await repo.complete(first!._id, first!.lockToken, {
+          result: 1,
+          outOfOrder: false,
+        }),
+      ).toBe(false);
     });
 
     it('hands one event to exactly one of two competing workers', async () => {
       await repo.insertIfAbsent(event());
       const [a, b] = await Promise.all([
-        repo.claimHead('p1', 'w1', 30_000, at(10)),
-        repo.claimHead('p1', 'w2', 30_000, at(10)),
+        head('p1', 'w1', at(10)),
+        head('p1', 'w2', at(10)),
       ]);
       expect([a, b].filter(Boolean)).toHaveLength(1);
     });
@@ -159,7 +219,7 @@ describe('EventsRepository', () => {
 
     it('records the outcome for the attempt holding the lock and clears the lock', async () => {
       await repo.insertIfAbsent(event());
-      const claimed = await repo.claimHead('p1', 'w1', 30_000, at(10));
+      const claimed = await head('p1', 'w1', at(10));
 
       const ok = await repo.complete(
         claimed!._id,
@@ -182,7 +242,7 @@ describe('EventsRepository', () => {
 
     it('refuses an outcome presented with a stale lock token', async () => {
       await repo.insertIfAbsent(event());
-      const claimed = await repo.claimHead('p1', 'w1', 30_000, at(10));
+      const claimed = await head('p1', 'w1', at(10));
 
       const ok = await repo.complete(claimed!._id, 'not-the-token', outcome);
 
@@ -193,9 +253,47 @@ describe('EventsRepository', () => {
       });
     });
 
+    it('puts an attempt back in line for later, keeping the error and clearing the lock', async () => {
+      await repo.insertIfAbsent(event());
+      const claimed = await head('p1', 'w1', at(10));
+
+      const ok = await repo.retryLater(
+        claimed!._id,
+        claimed!.lockToken,
+        'boom',
+        at(70),
+      );
+
+      expect(ok).toBe(true);
+      const doc = await stored(claimed!._id);
+      expect(doc).toMatchObject({
+        status: 'pending',
+        notBefore: at(70),
+        error: 'boom',
+        attempts: 1,
+      });
+      expect(doc).not.toHaveProperty('lockToken');
+      expect(await repo.claimHead('p1', 'w1', 30_000, at(60))).toEqual({
+        kind: 'blocked',
+        until: at(70),
+      });
+      expect(await head('p1', 'w1', at(71))).toMatchObject({ attempts: 2 });
+    });
+
+    it('refuses to re-line an attempt with a stale token', async () => {
+      await repo.insertIfAbsent(event());
+      const claimed = await head('p1', 'w1', at(10));
+      expect(await repo.retryLater(claimed!._id, 'stale', 'boom', at(70))).toBe(
+        false,
+      );
+      expect(await stored(claimed!._id)).toMatchObject({
+        status: 'processing',
+      });
+    });
+
     it('records a failure with its message', async () => {
       await repo.insertIfAbsent(event());
-      const claimed = await repo.claimHead('p1', 'w1', 30_000, at(10));
+      const claimed = await head('p1', 'w1', at(10));
 
       await repo.fail(claimed!._id, claimed!.lockToken, 'boom', at(15));
 

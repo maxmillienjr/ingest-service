@@ -12,6 +12,7 @@ import type { Env } from '../config/env.schema';
 import type { ClaimedEvent } from '../events/event.types';
 import { EventsRepository } from '../events/events.repository';
 import { PatientsRepository } from '../patients/patients.repository';
+import { retryDelayMs } from './backoff';
 import { EVENT_PROCESSOR, type EventProcessor } from './processor';
 
 /** Idle polling backs off from POLL_IDLE_MS up to this, then stays there. */
@@ -24,6 +25,9 @@ const MAX_IDLE_MS = 2_000;
  * number of instances can run against the same database: the lease keeps
  * two of them off one patient, and the lock token on each event keeps a
  * worker that lost its lock from writing the outcome.
+ *
+ * Crash recovery needs no sweeper. A lease or lock left behind by a dead
+ * process expires, and the claim predicates treat expired as claimable.
  */
 @Injectable()
 export class WorkerService
@@ -34,6 +38,8 @@ export class WorkerService
   private readonly logger = new Logger(WorkerService.name);
   /** patientId -> the lane draining it. */
   private readonly lanes = new Map<string, Promise<void>>();
+  /** patientId -> epoch ms before which its head cannot be claimed. Saves re-leasing a blocked patient. */
+  private readonly blockedUntil = new Map<string, number>();
   private running = false;
   private loop: Promise<void> = Promise.resolve();
   private wake: (() => void) | undefined;
@@ -43,6 +49,9 @@ export class WorkerService
   private readonly leaseTtlMs: number;
   private readonly pollIdleMs: number;
   private readonly shutdownGraceMs: number;
+  private readonly maxAttempts: number;
+  private readonly retryBaseMs: number;
+  private readonly retryMaxMs: number;
 
   constructor(
     private readonly events: EventsRepository,
@@ -55,6 +64,9 @@ export class WorkerService
     this.leaseTtlMs = config.get('LEASE_TTL_MS', { infer: true });
     this.pollIdleMs = config.get('POLL_IDLE_MS', { infer: true });
     this.shutdownGraceMs = config.get('SHUTDOWN_GRACE_MS', { infer: true });
+    this.maxAttempts = config.get('MAX_ATTEMPTS', { infer: true });
+    this.retryBaseMs = config.get('RETRY_BASE_MS', { infer: true });
+    this.retryMaxMs = config.get('RETRY_MAX_MS', { infer: true });
   }
 
   onApplicationBootstrap(): void {
@@ -111,11 +123,11 @@ export class WorkerService
   private async claimPatients(limit: number): Promise<number> {
     let started = 0;
     try {
-      // Over-fetch: some candidates are already ours or leased elsewhere.
+      // Over-fetch: some candidates are already ours, blocked, or leased elsewhere.
       const candidates = await this.events.claimablePatients(limit * 2);
       for (const patientId of candidates) {
         if (started >= limit || !this.running) break;
-        if (this.lanes.has(patientId)) continue;
+        if (this.lanes.has(patientId) || this.isBlocked(patientId)) continue;
         const leased = await this.patients.tryLease(
           patientId,
           this.workerId,
@@ -132,6 +144,14 @@ export class WorkerService
     return started;
   }
 
+  private isBlocked(patientId: string): boolean {
+    const until = this.blockedUntil.get(patientId);
+    if (until === undefined) return false;
+    if (until > Date.now()) return true;
+    this.blockedUntil.delete(patientId);
+    return false;
+  }
+
   private startLane(patientId: string): void {
     const lane = this.drainPatient(patientId).finally(() =>
       this.lanes.delete(patientId),
@@ -141,8 +161,9 @@ export class WorkerService
 
   /**
    * Applies one patient's ready events in order, one at a time. Stops when
-   * none are ready, when shutdown begins, or when the lease is lost to
-   * another worker. Never throws: a rejected lane would take the loop down.
+   * the head is not ready, when there is nothing left, when shutdown begins,
+   * or when the lease is lost to another worker. Never throws: a rejected
+   * lane would take the loop down.
    */
   private async drainPatient(patientId: string): Promise<void> {
     try {
@@ -156,13 +177,17 @@ export class WorkerService
           this.logger.warn(`patient ${patientId}: lease lost, handing over`);
           break;
         }
-        const event = await this.events.claimHead(
+        const claim = await this.events.claimHead(
           patientId,
           this.workerId,
           this.leaseTtlMs,
         );
-        if (!event) break;
-        await this.handle(event);
+        if (claim.kind === 'blocked') {
+          this.blockedUntil.set(patientId, claim.until.getTime());
+          break;
+        }
+        if (claim.kind === 'empty') break;
+        await this.handle(claim.event);
       }
     } catch (err) {
       this.logger.error(`patient ${patientId}: lane aborted: ${message(err)}`);
@@ -200,16 +225,41 @@ export class WorkerService
         );
       }
     } catch (err) {
-      this.logger.error(
-        `event ${event._id}: attempt ${event.attempts} failed: ${message(err)}`,
-      );
-      await this.events
-        .fail(event._id, event.lockToken, message(err))
-        .catch((e: unknown) =>
-          this.logger.error(
-            `event ${event._id}: could not record failure: ${message(e)}`,
-          ),
+      await this.recordFailure(event, message(err));
+    }
+  }
+
+  /** Retry with backoff until MAX_ATTEMPTS, then a visible terminal failure. Both fenced. */
+  private async recordFailure(
+    event: ClaimedEvent,
+    error: string,
+  ): Promise<void> {
+    try {
+      if (event.attempts >= this.maxAttempts) {
+        this.logger.error(
+          `event ${event._id}: attempt ${event.attempts} failed, giving up: ${error}`,
         );
+        await this.events.fail(event._id, event.lockToken, error);
+        return;
+      }
+      const delay = retryDelayMs(
+        event.attempts,
+        this.retryBaseMs,
+        this.retryMaxMs,
+      );
+      this.logger.warn(
+        `event ${event._id}: attempt ${event.attempts} failed, retry in ${delay}ms: ${error}`,
+      );
+      await this.events.retryLater(
+        event._id,
+        event.lockToken,
+        error,
+        new Date(Date.now() + delay),
+      );
+    } catch (err) {
+      this.logger.error(
+        `event ${event._id}: could not record failure: ${message(err)}`,
+      );
     }
   }
 

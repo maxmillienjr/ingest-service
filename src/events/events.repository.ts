@@ -1,5 +1,5 @@
 import { Inject, Injectable, OnModuleInit } from '@nestjs/common';
-import { Collection, Db } from 'mongodb';
+import { Collection, Db, Filter } from 'mongodb';
 import { randomUUID } from 'node:crypto';
 import { isDuplicateKey } from '../mongo/mongo-errors';
 import { MONGO_DB } from '../mongo/mongo.tokens';
@@ -9,6 +9,25 @@ export interface Outcome {
   result: unknown;
   outOfOrder: boolean;
 }
+
+/** What claiming a patient's head event can come back with. */
+export type HeadClaim =
+  | { kind: 'claimed'; event: ClaimedEvent }
+  /** The next event exists but is not claimable until `until` (grace, retry backoff, or a live lock). */
+  | { kind: 'blocked'; until: Date }
+  | { kind: 'empty' };
+
+/**
+ * Work a worker may take right now: never claimed, or claimed by an
+ * attempt whose lock has expired. That second arm is the whole crash
+ * recovery story; there is no sweeper.
+ */
+const claimable = (now: Date): Filter<EventDoc> => ({
+  $or: [
+    { status: 'pending', notBefore: { $lte: now } },
+    { status: 'processing', lockedUntil: { $lte: now } },
+  ],
+});
 
 /** Every query against the events collection lives here. */
 @Injectable()
@@ -21,8 +40,9 @@ export class EventsRepository implements OnModuleInit {
 
   async onModuleInit(): Promise<void> {
     await this.events.createIndexes([
-      // Candidate scan: what is claimable right now.
+      // Candidate scan, both arms of `claimable`.
       { key: { status: 1, notBefore: 1 } },
+      { key: { status: 1, lockedUntil: 1 } },
       // Per-patient head: the next event to apply for one patient.
       { key: { patientId: 1, status: 1, ts: 1, receivedAt: 1 } },
     ]);
@@ -56,28 +76,46 @@ export class EventsRepository implements OnModuleInit {
    */
   async claimablePatients(limit: number, now = new Date()): Promise<string[]> {
     const docs = await this.events
-      .find(
-        { status: 'pending', notBefore: { $lte: now } },
-        { projection: { patientId: 1 }, sort: { notBefore: 1 }, limit },
-      )
+      .find(claimable(now), {
+        projection: { patientId: 1 },
+        sort: { notBefore: 1 },
+        limit,
+      })
       .toArray();
     return [...new Set(docs.map((doc) => doc.patientId))];
   }
 
   /**
-   * Atomically takes one patient's next event in `ts` order (receipt order
-   * breaks ties). The lock token it mints is the fence: every later write
-   * for this attempt must present it, so a worker that lost its lock
-   * cannot overwrite the outcome.
+   * Takes one patient's next event in `ts` order (receipt order breaks
+   * ties). The head is the smallest-ts event that is not finished, ready or
+   * not: an event waiting out its grace window, its retry backoff, or a
+   * still-live lock holds the line, so a hiccup cannot reorder a patient.
+   *
+   * Only the patient's lease holder calls this, which is what makes the
+   * read-then-update safe. The update is still conditional, so a stale
+   * attempt cannot take a document out from under a live one.
    */
   async claimHead(
     patientId: string,
     workerId: string,
     lockTtlMs: number,
     now = new Date(),
-  ): Promise<ClaimedEvent | null> {
+  ): Promise<HeadClaim> {
+    const head = await this.events.findOne(
+      { patientId, status: { $in: ['pending', 'processing'] } },
+      {
+        sort: { ts: 1, receivedAt: 1 },
+        projection: { _id: 1, status: 1, notBefore: 1, lockedUntil: 1 },
+      },
+    );
+    if (!head) return { kind: 'empty' };
+
+    const readyAt =
+      head.status === 'pending' ? head.notBefore : head.lockedUntil;
+    if (readyAt && readyAt > now) return { kind: 'blocked', until: readyAt };
+
     const claimed = await this.events.findOneAndUpdate(
-      { patientId, status: 'pending', notBefore: { $lte: now } },
+      { _id: head._id, ...claimable(now) },
       {
         $set: {
           status: 'processing',
@@ -87,9 +125,11 @@ export class EventsRepository implements OnModuleInit {
         },
         $inc: { attempts: 1 },
       },
-      { sort: { ts: 1, receivedAt: 1 }, returnDocument: 'after' },
+      { returnDocument: 'after' },
     );
-    return claimed as ClaimedEvent | null;
+    return claimed
+      ? { kind: 'claimed', event: claimed as ClaimedEvent }
+      : { kind: 'empty' };
   }
 
   /** Records success, but only for the attempt that still holds the lock. */
@@ -114,7 +154,24 @@ export class EventsRepository implements OnModuleInit {
     return res.matchedCount === 1;
   }
 
-  /** Records a failure, fenced the same way. */
+  /** Puts a failed attempt back in line for a later try. Fenced. */
+  async retryLater(
+    id: string,
+    lockToken: string,
+    error: string,
+    notBefore: Date,
+  ): Promise<boolean> {
+    const res = await this.events.updateOne(
+      { _id: id, lockToken },
+      {
+        $set: { status: 'pending', notBefore, error },
+        $unset: { lockToken: '', lockedBy: '', lockedUntil: '' },
+      },
+    );
+    return res.matchedCount === 1;
+  }
+
+  /** Records a terminal failure. Fenced. */
   async fail(
     id: string,
     lockToken: string,

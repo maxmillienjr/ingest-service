@@ -33,6 +33,7 @@ export interface EventDoc {
   outOfOrder?: boolean;
   processedAt?: Date;
   result?: unknown;
+  /** Message of the latest failed attempt. Kept after a later success, so a retried event shows its history. */
   error?: string;
 }
 

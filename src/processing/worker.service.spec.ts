@@ -3,7 +3,11 @@ import { ConfigService } from '@nestjs/config';
 import { Test } from '@nestjs/testing';
 import type { Env } from '../config/env.schema';
 import type { ClaimedEvent } from '../events/event.types';
-import { EventsRepository, type Outcome } from '../events/events.repository';
+import {
+  EventsRepository,
+  type HeadClaim,
+  type Outcome,
+} from '../events/events.repository';
 import { PatientsRepository } from '../patients/patients.repository';
 import { EVENT_PROCESSOR, type EventProcessor } from './processor';
 import { WorkerService } from './worker.service';
@@ -13,6 +17,9 @@ class FakeEvents {
   queues = new Map<string, ClaimedEvent[]>();
   completed: Array<{ id: string; lockToken: string } & Outcome> = [];
   failed: Array<{ id: string; lockToken: string; error: string }> = [];
+  retried: Array<{ id: string; lockToken: string; notBefore: Date }> = [];
+  /** patientId -> the head is not claimable until then. */
+  blocked = new Map<string, Date>();
   completeResult = true;
 
   add(...events: ClaimedEvent[]): void {
@@ -27,8 +34,22 @@ class FakeEvents {
       [...this.queues].filter(([, q]) => q.length > 0).map(([p]) => p),
     );
   }
-  claimHead(patientId: string): Promise<ClaimedEvent | null> {
-    return Promise.resolve(this.queues.get(patientId)?.shift() ?? null);
+  claimHead(patientId: string): Promise<HeadClaim> {
+    const until = this.blocked.get(patientId);
+    if (until) return Promise.resolve({ kind: 'blocked', until });
+    const event = this.queues.get(patientId)?.shift();
+    return Promise.resolve(
+      event ? { kind: 'claimed', event } : { kind: 'empty' },
+    );
+  }
+  retryLater(
+    id: string,
+    lockToken: string,
+    _error: string,
+    notBefore: Date,
+  ): Promise<boolean> {
+    this.retried.push({ id, lockToken, notBefore });
+    return Promise.resolve(true);
   }
   complete(id: string, lockToken: string, outcome: Outcome): Promise<boolean> {
     this.completed.push({ id, lockToken, ...outcome });
@@ -47,7 +68,10 @@ class FakePatients {
   released: string[] = [];
   renewResult = true;
 
+  leaseAttempts = 0;
+
   tryLease(patientId: string, workerId: string): Promise<boolean> {
+    this.leaseAttempts += 1;
     if (this.leases.has(patientId)) return Promise.resolve(false);
     this.leases.set(patientId, workerId);
     return Promise.resolve(true);
@@ -89,12 +113,17 @@ class FakeProcessor implements EventProcessor {
   }
 }
 
-const claimed = (id: string, patientId = 'p1', tsSeconds = 0): ClaimedEvent =>
+const claimed = (
+  id: string,
+  patientId = 'p1',
+  tsSeconds = 0,
+  attempts = 1,
+): ClaimedEvent =>
   ({
     _id: id,
     patientId,
     ts: new Date(tsSeconds * 1000),
-    attempts: 1,
+    attempts,
     lockToken: `token-${id}`,
   }) as ClaimedEvent;
 
@@ -104,6 +133,9 @@ const defaults: Partial<Env> = {
   LEASE_TTL_MS: 1_000,
   POLL_IDLE_MS: 5,
   SHUTDOWN_GRACE_MS: 300,
+  MAX_ATTEMPTS: 3,
+  RETRY_BASE_MS: 100,
+  RETRY_MAX_MS: 1_000,
 };
 
 async function build(overrides: Partial<Env> = {}): Promise<{
@@ -226,26 +258,62 @@ describe('WorkerService', () => {
     expect(warn).toHaveBeenCalledWith(expect.stringContaining('out of order'));
   });
 
-  it("records a failed attempt and continues with the patient's next event", async () => {
+  it('puts a failed attempt back in line with exponential backoff', async () => {
     const { worker, events, processor } = await build();
-    processor.behaviour = (event) =>
-      event._id === 'a'
-        ? Promise.reject(new Error('external system down'))
-        : Promise.resolve('ok');
-    events.add(claimed('a', 'p1', 1), claimed('b', 'p1', 2));
+    processor.behaviour = () =>
+      Promise.reject(new Error('external system down'));
+    events.add(claimed('a', 'p1', 1, 1), claimed('b', 'p1', 2, 2));
 
     worker.onApplicationBootstrap();
-    await until(
-      () => events.failed.length === 1 && events.completed.length === 1,
+    await until(() => events.retried.length === 2);
+    await worker.beforeApplicationShutdown();
+
+    const [first, second] = events.retried;
+    expect(first).toMatchObject({ id: 'a', lockToken: 'token-a' });
+    expect(second).toMatchObject({ id: 'b', lockToken: 'token-b' });
+    // attempt 1 -> base delay, attempt 2 -> double.
+    expect(first!.notBefore.getTime() - Date.now()).toBeLessThanOrEqual(100);
+    expect(
+      second!.notBefore.getTime() - first!.notBefore.getTime(),
+    ).toBeGreaterThanOrEqual(90);
+    expect(events.failed).toEqual([]);
+    expect(warn).toHaveBeenCalledWith(
+      expect.stringContaining('retry in 100ms'),
     );
+  });
+
+  it('gives up after MAX_ATTEMPTS with a visible failure', async () => {
+    const { worker, events, processor } = await build({ MAX_ATTEMPTS: 3 });
+    processor.behaviour = () => Promise.reject(new Error('still down'));
+    events.add(claimed('a', 'p1', 1, 3));
+
+    worker.onApplicationBootstrap();
+    await until(() => events.failed.length === 1);
     await worker.beforeApplicationShutdown();
 
     expect(events.failed[0]).toEqual({
       id: 'a',
       lockToken: 'token-a',
-      error: 'external system down',
+      error: 'still down',
     });
-    expect(events.completed[0]).toMatchObject({ id: 'b' });
+    expect(events.retried).toEqual([]);
+  });
+
+  it('leaves a blocked patient alone until its head becomes claimable', async () => {
+    const { worker, events, patients } = await build();
+    events.add(claimed('a'));
+    events.blocked.set('p1', new Date(Date.now() + 150));
+
+    worker.onApplicationBootstrap();
+    await sleep(60);
+    const attemptsWhileBlocked = patients.leaseAttempts;
+    expect(attemptsWhileBlocked).toBe(1);
+    expect(patients.leases.size).toBe(0);
+
+    events.blocked.delete('p1');
+    await until(() => events.completed.length === 1);
+    await worker.beforeApplicationShutdown();
+    expect(patients.leaseAttempts).toBeGreaterThanOrEqual(2);
   });
 
   it('discards the outcome and warns when the lock was lost', async () => {

@@ -75,20 +75,35 @@ describe('WorkerService against MongoDB', () => {
     SHUTDOWN_GRACE_MS: 2_000,
   };
 
-  async function worker(): Promise<WorkerService> {
+  async function worker(
+    proc: EventProcessor = processor,
+    cfg: Partial<Env> = config,
+  ): Promise<WorkerService> {
     const moduleRef = await Test.createTestingModule({
       providers: [
         WorkerService,
         { provide: EventsRepository, useValue: events },
         { provide: PatientsRepository, useValue: patients },
-        { provide: EVENT_PROCESSOR, useValue: processor },
+        { provide: EVENT_PROCESSOR, useValue: proc },
         {
           provide: ConfigService,
-          useValue: { get: (key: keyof Env) => config[key] },
+          useValue: { get: (key: keyof Env) => cfg[key] },
         },
       ],
     }).compile();
     return moduleRef.get(WorkerService);
+  }
+
+  async function until(
+    condition: () => boolean,
+    timeoutMs = 3_000,
+  ): Promise<void> {
+    const started = Date.now();
+    while (!condition()) {
+      if (Date.now() - started > timeoutMs)
+        throw new Error('condition not met');
+      await sleep(5);
+    }
   }
 
   const T0 = new Date('2026-01-01T00:00:00Z');
@@ -187,5 +202,85 @@ describe('WorkerService against MongoDB', () => {
         .collection<PatientDoc>('patients')
         .findOne({ _id: 'p1' }),
     ).toMatchObject({ lastAppliedTs: new Date(T0.getTime() + 9 * 1000) });
+  });
+
+  it('recovers an event whose worker died mid-call: one outcome, two attempts, no sweeper', async () => {
+    // What a SIGKILLed worker leaves behind: a stale lease and an expired lock.
+    const stale = new Date(Date.now() - 10_000);
+    await client
+      .db()
+      .collection<PatientDoc>('patients')
+      .updateOne(
+        { _id: 'p3' },
+        { $set: { leaseOwner: 'dead-worker', leaseUntil: stale } },
+        { upsert: true },
+      );
+    await events.insertIfAbsent({
+      _id: 'p3-00',
+      patientId: 'p3',
+      type: 'vitals',
+      data: {},
+      ts: T0,
+      receivedAt: past,
+      status: 'processing',
+      notBefore: past,
+      attempts: 1,
+      lockToken: 'dead-token',
+      lockedBy: 'dead-worker',
+      lockedUntil: stale,
+    });
+
+    const w = await worker();
+    w.onApplicationBootstrap();
+    await untilAllDone(18);
+    await w.beforeApplicationShutdown();
+
+    expect(await events.findById('p3-00')).toMatchObject({
+      status: 'done',
+      attempts: 2,
+      result: { eventId: 'p3-00' },
+    });
+  });
+
+  it('fences out a stalled attempt after another worker took over its expired lock', async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => {
+      release = r;
+    });
+    let stalledCalls = 0;
+    const stalled: EventProcessor = {
+      async process(event) {
+        stalledCalls += 1;
+        await gate;
+        return { eventId: event._id, by: 'stalled' };
+      },
+    };
+    const shortLease = { ...config, LEASE_TTL_MS: 300, SHUTDOWN_GRACE_MS: 100 };
+    await insert('p4', 0);
+
+    const wA = await worker(stalled, shortLease);
+    wA.onApplicationBootstrap();
+    await until(() => stalledCalls === 1);
+
+    // A's lock and lease expire 300ms after its claim; B takes over.
+    const wB = await worker(processor, shortLease);
+    wB.onApplicationBootstrap();
+    await untilAllDone(19);
+
+    // A wakes up late and tries to write its outcome with a stale token.
+    release();
+    await sleep(50);
+    await Promise.all([
+      wA.beforeApplicationShutdown(),
+      wB.beforeApplicationShutdown(),
+    ]);
+
+    const doc = await events.findById('p4-00');
+    expect(doc).toMatchObject({
+      status: 'done',
+      attempts: 2,
+      result: { eventId: 'p4-00' },
+    });
+    expect(doc?.result).not.toMatchObject({ by: 'stalled' });
   });
 });
