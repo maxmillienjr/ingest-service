@@ -148,12 +148,15 @@ the current lease, `lastAppliedTs` is the ordering watermark.
 Indexes: `{ status, notBefore }` and `{ status, lockedUntil }` for the candidate scan,
 `{ patientId, status, ts, receivedAt }` for the per-patient head.
 
-## Decisions and their downsides
+## Decisions and trade-offs
+
+Each decision, why it won, and what it costs.
 
 **MongoDB as the queue, not a broker.** Zero extra infrastructure, and the work item and its
 outcome are the same record. The downside is the polling claim: every idle worker scans for
-candidates on a backoff up to two seconds, and at some multiple of today's volume that scan,
-not the processing, becomes the bottleneck. The growth path is in the last section.
+candidates on a backoff up to two seconds. At today's volume the scan is a rounding error
+next to the five-second call, but it is the part that does not scale out with more workers,
+and it is where the growth path in the last section starts.
 
 **Native driver behind repositories, not an ODM.** The correctness of this service is a
 handful of atomic updates: the insert that dedupes, the upsert that is the lease, the
@@ -172,9 +175,10 @@ sends two byte-identical events (which the `ts` makes unlikely) gets one. An
 acknowledges before it can know whether an older event is still on its way, so rejecting late
 events is impossible and holding events forever is unacceptable. The window
 (`ORDERING_GRACE_MS`, 2 s) absorbs ordinary reordering in transit. An event that arrives after
-its successors were applied is still applied, and flagged so downstream can decide. The
-downside is that a flagged event has been applied out of sequence; only an event-sourced
-patient state could fold it in properly.
+its successors were applied is still applied, and flagged so downstream can decide. The cost
+is two seconds added to every event's time to completion, paid whether or not anything
+arrived out of order, and a flagged event has still been applied out of sequence; only an
+event-sourced patient state could fold it in properly.
 
 **A transient failure holds the patient's line.** A failed attempt is retried with backoff,
 and the patient's later events wait for it. This is the conservative choice for clinical
@@ -197,16 +201,6 @@ switch shows that with no duplication.
 **Nest 11, Jest, ESLint, zod for config.** The defaults a Nest reader expects, so there is
 nothing in the toolchain to explain. Configuration is validated once at boot by a zod schema
 and injected as a typed `ConfigService`; a bad value fails the start, not the first request.
-
-<!-- MAX: trade-offs section, your voice. Prompts, delete when done:
-- what you knowingly did not build (auth, metrics, replay, archival) and why each waited
-- the two-collection call in your own words
-- the honest limit of the polling design and the number where you'd move to Kafka
-- what the settling window costs (2 s of latency on every event) and why you took it
--->
-## Trade-offs I accepted
-
-_(to be written)_
 
 ## Seeing it hold up
 
