@@ -68,6 +68,10 @@ describe('/events', () => {
     it.each([
       ['a missing field', { patientId: 'p1', type: 'vitals', data: {} }],
       ['a malformed timestamp', { ...valid(), ts: 'yesterday' }],
+      [
+        'a timestamp far in the future',
+        { ...valid(), ts: '3000-01-01T00:00:00Z' },
+      ],
       ['an unknown top-level field', { ...valid(), extra: true }],
       ['non-object data', { ...valid(), data: [1, 2] }],
       ['an empty patientId', { ...valid(), patientId: '' }],

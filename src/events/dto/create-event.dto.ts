@@ -5,6 +5,7 @@ import {
   IsString,
   MaxLength,
 } from 'class-validator';
+import { IsNotInTheFuture } from './is-not-in-the-future';
 
 /**
  * The wire contract from the assignment. Top-level fields are strict
@@ -26,5 +27,6 @@ export class CreateEventDto {
   data!: Record<string, unknown>;
 
   @IsISO8601({ strict: true })
+  @IsNotInTheFuture()
   ts!: string;
 }
