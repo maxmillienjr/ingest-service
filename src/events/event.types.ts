@@ -26,13 +26,22 @@ export interface EventDoc {
   /** Incremented on every claim, including re-claims after a crash. */
   attempts: number;
 
+  /** Fencing token for the current attempt. Every outcome write must present it. */
   lockToken?: string;
+  lockedBy?: string;
   lockedUntil?: Date;
   outOfOrder?: boolean;
   processedAt?: Date;
   result?: unknown;
   error?: string;
 }
+
+/** An event a worker has just claimed: the lock fields are guaranteed. */
+export type ClaimedEvent = EventDoc & {
+  lockToken: string;
+  lockedBy: string;
+  lockedUntil: Date;
+};
 
 /** What a sender gets back, whether the event is new or a duplicate. */
 export interface EventReceipt {

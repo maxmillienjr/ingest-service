@@ -1,7 +1,8 @@
 import { Inject, Injectable, OnModuleInit } from '@nestjs/common';
 import { Collection, Db, MongoServerError } from 'mongodb';
+import { randomUUID } from 'node:crypto';
 import { MONGO_DB } from '../mongo/mongo.tokens';
-import type { EventDoc } from './event.types';
+import type { ClaimedEvent, EventDoc } from './event.types';
 
 const DUPLICATE_KEY = 11000;
 
@@ -43,6 +44,66 @@ export class EventsRepository implements OnModuleInit {
 
   findById(id: string): Promise<EventDoc | null> {
     return this.events.findOne({ _id: id });
+  }
+
+  /**
+   * Atomically hands the oldest claimable event to one worker. The lock
+   * token it mints is the fence: every later write for this attempt must
+   * present it, so a worker that lost its lock cannot overwrite the outcome.
+   */
+  async claimNext(
+    workerId: string,
+    lockTtlMs: number,
+    now = new Date(),
+  ): Promise<ClaimedEvent | null> {
+    const claimed = await this.events.findOneAndUpdate(
+      { status: 'pending', notBefore: { $lte: now } },
+      {
+        $set: {
+          status: 'processing',
+          lockToken: randomUUID(),
+          lockedBy: workerId,
+          lockedUntil: new Date(now.getTime() + lockTtlMs),
+        },
+        $inc: { attempts: 1 },
+      },
+      { sort: { notBefore: 1 }, returnDocument: 'after' },
+    );
+    return claimed as ClaimedEvent | null;
+  }
+
+  /** Records success, but only for the attempt that still holds the lock. */
+  async complete(
+    id: string,
+    lockToken: string,
+    result: unknown,
+    now = new Date(),
+  ): Promise<boolean> {
+    const res = await this.events.updateOne(
+      { _id: id, lockToken },
+      {
+        $set: { status: 'done', result, processedAt: now },
+        $unset: { lockToken: '', lockedBy: '', lockedUntil: '' },
+      },
+    );
+    return res.matchedCount === 1;
+  }
+
+  /** Records a failure, fenced the same way. */
+  async fail(
+    id: string,
+    lockToken: string,
+    error: string,
+    now = new Date(),
+  ): Promise<boolean> {
+    const res = await this.events.updateOne(
+      { _id: id, lockToken },
+      {
+        $set: { status: 'failed', error, processedAt: now },
+        $unset: { lockToken: '', lockedBy: '', lockedUntil: '' },
+      },
+    );
+    return res.matchedCount === 1;
   }
 }
 

@@ -12,7 +12,8 @@ describe('/events', () => {
 
   beforeAll(async () => {
     mongo = await startMongoMemory();
-    process.env.MONGO_URI = mongo.uri;
+    // HTTP contract only: the worker loop stays off so stored state is stable.
+    Object.assign(process.env, { MONGO_URI: mongo.uri, ROLE: 'api' });
 
     // Built from AppModule, so the global ValidationPipe is the real one.
     const moduleRef = await Test.createTestingModule({
