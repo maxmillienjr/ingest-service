@@ -6,6 +6,9 @@
 # deps
 /node_modules
 
+# load runs
+load-manifest.json
+
 # env
 .env
 .env.*
