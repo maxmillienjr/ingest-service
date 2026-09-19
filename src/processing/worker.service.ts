@@ -11,16 +11,19 @@ import { hostname } from 'node:os';
 import type { Env } from '../config/env.schema';
 import type { ClaimedEvent } from '../events/event.types';
 import { EventsRepository } from '../events/events.repository';
+import { PatientsRepository } from '../patients/patients.repository';
 import { EVENT_PROCESSOR, type EventProcessor } from './processor';
 
 /** Idle polling backs off from POLL_IDLE_MS up to this, then stays there. */
 const MAX_IDLE_MS = 2_000;
 
 /**
- * Pulls claimable events from the collection and runs them through the
- * processor, up to WORKER_CONCURRENCY at a time. Any number of instances
- * can run against the same database: the claim is atomic and every
- * outcome write is fenced by the lock token the claim handed out.
+ * Works patients, not events. A lane leases one patient and applies that
+ * patient's events one at a time in `ts` order until none are ready, then
+ * lets the lease go. Up to WORKER_CONCURRENCY lanes run at once, and any
+ * number of instances can run against the same database: the lease keeps
+ * two of them off one patient, and the lock token on each event keeps a
+ * worker that lost its lock from writing the outcome.
  */
 @Injectable()
 export class WorkerService
@@ -29,25 +32,27 @@ export class WorkerService
   readonly workerId = `${hostname()}-${process.pid}-${randomUUID().slice(0, 8)}`;
 
   private readonly logger = new Logger(WorkerService.name);
-  private readonly lanes = new Set<Promise<void>>();
+  /** patientId -> the lane draining it. */
+  private readonly lanes = new Map<string, Promise<void>>();
   private running = false;
   private loop: Promise<void> = Promise.resolve();
   private wake: (() => void) | undefined;
 
   private readonly role: Env['ROLE'];
   private readonly concurrency: number;
-  private readonly lockTtlMs: number;
+  private readonly leaseTtlMs: number;
   private readonly pollIdleMs: number;
   private readonly shutdownGraceMs: number;
 
   constructor(
     private readonly events: EventsRepository,
+    private readonly patients: PatientsRepository,
     @Inject(EVENT_PROCESSOR) private readonly processor: EventProcessor,
     config: ConfigService<Env, true>,
   ) {
     this.role = config.get('ROLE', { infer: true });
     this.concurrency = config.get('WORKER_CONCURRENCY', { infer: true });
-    this.lockTtlMs = config.get('LEASE_TTL_MS', { infer: true });
+    this.leaseTtlMs = config.get('LEASE_TTL_MS', { infer: true });
     this.pollIdleMs = config.get('POLL_IDLE_MS', { infer: true });
     this.shutdownGraceMs = config.get('SHUTDOWN_GRACE_MS', { infer: true });
   }
@@ -62,9 +67,9 @@ export class WorkerService
   }
 
   /**
-   * Runs before connections close: stop claiming, let in-flight lanes
-   * finish inside the grace period. Anything still running after that keeps
-   * its lock until it expires, and another worker picks it up.
+   * Runs before connections close: stop claiming, let each lane finish the
+   * event it is on, inside the grace period. A lane still running after
+   * that keeps its locks until they expire, and another worker takes over.
    */
   async beforeApplicationShutdown(): Promise<void> {
     if (!this.running) return;
@@ -75,10 +80,10 @@ export class WorkerService
     const inFlight = this.lanes.size;
     const drained = await this.drain(this.shutdownGraceMs);
     if (drained) {
-      this.logger.log(`worker stopped, drained ${inFlight} in-flight event(s)`);
+      this.logger.log(`worker stopped, drained ${inFlight} in-flight lane(s)`);
     } else {
       this.logger.warn(
-        `worker stopped with ${this.lanes.size} event(s) still in flight after ${this.shutdownGraceMs}ms; their locks will expire and be retried`,
+        `worker stopped with ${this.lanes.size} lane(s) still in flight after ${this.shutdownGraceMs}ms; their locks will expire and be retried`,
       );
     }
   }
@@ -86,14 +91,13 @@ export class WorkerService
   private async run(): Promise<void> {
     let idleRounds = 0;
     while (this.running) {
-      if (this.lanes.size >= this.concurrency) {
-        await Promise.race(this.lanes);
+      const free = this.concurrency - this.lanes.size;
+      if (free <= 0) {
+        await Promise.race(this.lanes.values());
         continue;
       }
-      const event = await this.claim();
-      if (event) {
+      if ((await this.claimPatients(free)) > 0) {
         idleRounds = 0;
-        this.startLane(event);
         continue;
       }
       idleRounds += 1;
@@ -103,32 +107,96 @@ export class WorkerService
     }
   }
 
-  private async claim(): Promise<ClaimedEvent | null> {
+  /** Leases up to `limit` patients that have ready work and starts a lane for each. */
+  private async claimPatients(limit: number): Promise<number> {
+    let started = 0;
     try {
-      return await this.events.claimNext(this.workerId, this.lockTtlMs);
+      // Over-fetch: some candidates are already ours or leased elsewhere.
+      const candidates = await this.events.claimablePatients(limit * 2);
+      for (const patientId of candidates) {
+        if (started >= limit || !this.running) break;
+        if (this.lanes.has(patientId)) continue;
+        const leased = await this.patients.tryLease(
+          patientId,
+          this.workerId,
+          this.leaseTtlMs,
+        );
+        if (leased) {
+          this.startLane(patientId);
+          started += 1;
+        }
+      }
     } catch (err) {
       this.logger.error(`claim failed: ${message(err)}`);
-      return null;
+    }
+    return started;
+  }
+
+  private startLane(patientId: string): void {
+    const lane = this.drainPatient(patientId).finally(() =>
+      this.lanes.delete(patientId),
+    );
+    this.lanes.set(patientId, lane);
+  }
+
+  /**
+   * Applies one patient's ready events in order, one at a time. Stops when
+   * none are ready, when shutdown begins, or when the lease is lost to
+   * another worker. Never throws: a rejected lane would take the loop down.
+   */
+  private async drainPatient(patientId: string): Promise<void> {
+    try {
+      while (this.running) {
+        const held = await this.patients.renewLease(
+          patientId,
+          this.workerId,
+          this.leaseTtlMs,
+        );
+        if (!held) {
+          this.logger.warn(`patient ${patientId}: lease lost, handing over`);
+          break;
+        }
+        const event = await this.events.claimHead(
+          patientId,
+          this.workerId,
+          this.leaseTtlMs,
+        );
+        if (!event) break;
+        await this.handle(event);
+      }
+    } catch (err) {
+      this.logger.error(`patient ${patientId}: lane aborted: ${message(err)}`);
+    } finally {
+      await this.patients
+        .releaseLease(patientId, this.workerId)
+        .catch((err: unknown) =>
+          this.logger.error(
+            `patient ${patientId}: could not release lease: ${message(err)}`,
+          ),
+        );
     }
   }
 
-  private startLane(event: ClaimedEvent): void {
-    const lane = this.handle(event).finally(() => this.lanes.delete(lane));
-    this.lanes.add(lane);
-  }
-
-  /** Never throws: a rejected lane would take the loop down with it. */
   private async handle(event: ClaimedEvent): Promise<void> {
     try {
       const result = await this.processor.process(event);
-      const recorded = await this.events.complete(
-        event._id,
-        event.lockToken,
-        result,
+      const watermark = await this.patients.advanceWatermark(
+        event.patientId,
+        event.ts,
       );
+      const outOfOrder =
+        watermark !== null && event.ts.getTime() < watermark.getTime();
+      const recorded = await this.events.complete(event._id, event.lockToken, {
+        result,
+        outOfOrder,
+      });
       if (!recorded) {
         this.logger.warn(
           `event ${event._id}: lock lost before completion, outcome discarded`,
+        );
+      } else if (outOfOrder) {
+        this.logger.warn(
+          `event ${event._id}: applied out of order for patient ${event.patientId} (ts ${event.ts.toISOString()} is behind ${watermark.toISOString()})`,
         );
       }
     } catch (err) {
@@ -165,7 +233,7 @@ export class WorkerService
     });
     try {
       return await Promise.race([
-        Promise.all(this.lanes).then(() => true as const),
+        Promise.all(this.lanes.values()).then(() => true as const),
         expired,
       ]);
     } finally {

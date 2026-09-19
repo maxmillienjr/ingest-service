@@ -1,10 +1,14 @@
 import { Inject, Injectable, OnModuleInit } from '@nestjs/common';
-import { Collection, Db, MongoServerError } from 'mongodb';
+import { Collection, Db } from 'mongodb';
 import { randomUUID } from 'node:crypto';
+import { isDuplicateKey } from '../mongo/mongo-errors';
 import { MONGO_DB } from '../mongo/mongo.tokens';
 import type { ClaimedEvent, EventDoc } from './event.types';
 
-const DUPLICATE_KEY = 11000;
+export interface Outcome {
+  result: unknown;
+  outOfOrder: boolean;
+}
 
 /** Every query against the events collection lives here. */
 @Injectable()
@@ -47,17 +51,33 @@ export class EventsRepository implements OnModuleInit {
   }
 
   /**
-   * Atomically hands the oldest claimable event to one worker. The lock
-   * token it mints is the fence: every later write for this attempt must
-   * present it, so a worker that lost its lock cannot overwrite the outcome.
+   * Patients that have something claimable, oldest work first. Callers
+   * lease a patient before touching its events, so this is only a hint.
    */
-  async claimNext(
+  async claimablePatients(limit: number, now = new Date()): Promise<string[]> {
+    const docs = await this.events
+      .find(
+        { status: 'pending', notBefore: { $lte: now } },
+        { projection: { patientId: 1 }, sort: { notBefore: 1 }, limit },
+      )
+      .toArray();
+    return [...new Set(docs.map((doc) => doc.patientId))];
+  }
+
+  /**
+   * Atomically takes one patient's next event in `ts` order (receipt order
+   * breaks ties). The lock token it mints is the fence: every later write
+   * for this attempt must present it, so a worker that lost its lock
+   * cannot overwrite the outcome.
+   */
+  async claimHead(
+    patientId: string,
     workerId: string,
     lockTtlMs: number,
     now = new Date(),
   ): Promise<ClaimedEvent | null> {
     const claimed = await this.events.findOneAndUpdate(
-      { status: 'pending', notBefore: { $lte: now } },
+      { patientId, status: 'pending', notBefore: { $lte: now } },
       {
         $set: {
           status: 'processing',
@@ -67,7 +87,7 @@ export class EventsRepository implements OnModuleInit {
         },
         $inc: { attempts: 1 },
       },
-      { sort: { notBefore: 1 }, returnDocument: 'after' },
+      { sort: { ts: 1, receivedAt: 1 }, returnDocument: 'after' },
     );
     return claimed as ClaimedEvent | null;
   }
@@ -76,13 +96,18 @@ export class EventsRepository implements OnModuleInit {
   async complete(
     id: string,
     lockToken: string,
-    result: unknown,
+    outcome: Outcome,
     now = new Date(),
   ): Promise<boolean> {
     const res = await this.events.updateOne(
       { _id: id, lockToken },
       {
-        $set: { status: 'done', result, processedAt: now },
+        $set: {
+          status: 'done',
+          result: outcome.result,
+          outOfOrder: outcome.outOfOrder,
+          processedAt: now,
+        },
         $unset: { lockToken: '', lockedBy: '', lockedUntil: '' },
       },
     );
@@ -105,8 +130,4 @@ export class EventsRepository implements OnModuleInit {
     );
     return res.matchedCount === 1;
   }
-}
-
-function isDuplicateKey(err: unknown): boolean {
-  return err instanceof MongoServerError && err.code === DUPLICATE_KEY;
 }
