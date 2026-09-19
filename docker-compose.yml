@@ -13,7 +13,8 @@ x-app: &app
 
 services:
   mongo:
-    image: mongo:8
+    # 8.2, not 8.0: 8.0 refuses to start on Linux kernels >= 6.19 (SERVER-121912).
+    image: mongo:8.2
     ports:
       - '27017:27017'
     volumes:

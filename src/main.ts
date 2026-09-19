@@ -1,14 +1,21 @@
 import { Logger } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import { NestFactory } from '@nestjs/core';
 import { AppModule } from './app.module';
+import type { AppConfig } from './config/env.schema';
 
 async function bootstrap(): Promise<void> {
   const app = await NestFactory.create(AppModule);
   // Lets SIGTERM/SIGINT reach onApplicationShutdown so in-flight work can drain.
   app.enableShutdownHooks();
-  const port = Number(process.env.PORT ?? 3000);
+
+  const config = app.get<AppConfig>(ConfigService);
+  const port = config.get('PORT', { infer: true });
   await app.listen(port);
-  Logger.log(`Listening on :${port}`, 'Bootstrap');
+  Logger.log(
+    `Listening on :${port} as role=${config.get('ROLE', { infer: true })}`,
+    'Bootstrap',
+  );
 }
 
 bootstrap().catch((err: unknown) => {
