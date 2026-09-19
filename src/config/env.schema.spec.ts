@@ -20,6 +20,15 @@ describe('validateEnv', () => {
     });
   });
 
+  it('rejects a lease that a processing call could outlive', () => {
+    expect(() =>
+      validateEnv({ PROCESSING_DELAY_MS: '20000', LEASE_TTL_MS: '30000' }),
+    ).toThrow(/LEASE_TTL_MS must be at least twice PROCESSING_DELAY_MS/);
+    expect(
+      validateEnv({ PROCESSING_DELAY_MS: '15000', LEASE_TTL_MS: '30000' }),
+    ).toMatchObject({ LEASE_TTL_MS: 30_000 });
+  });
+
   it('rejects an unknown role and names the variable', () => {
     expect(() => validateEnv({ ROLE: 'batch' })).toThrow(/ROLE/);
   });

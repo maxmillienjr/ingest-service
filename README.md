@@ -70,7 +70,9 @@ would pollute every read of the outcome collection to save one `createCollection
 
 1. `ValidationPipe` (`whitelist`, `forbidNonWhitelisted`, `transform`) rejects unknown or
    malformed fields with `400`. It is registered as a provider, so a test app built from
-   `AppModule` validates exactly like production.
+   `AppModule` validates exactly like production. A `ts` more than five minutes ahead of our
+   clock is also rejected: one far-future timestamp would become its patient's ordering
+   watermark and flag every later event, permanently.
 2. The event id is computed: SHA-256 over `patientId`, `type`, `ts` as epoch milliseconds, and
    `data` with keys sorted at every depth. Two payloads that mean the same thing get the same
    id, whatever the key order.
@@ -306,6 +308,9 @@ Not tested on purpose: the real five-second sleep, Terminus internals, the load 
   `events` collection becomes an outbox, the workers become consumers, and the lease and lock
   layer is deleted. Before that step, partitioning the claim scan by `hash(patientId) % N` per
   worker cuts lease contention with no new infrastructure.
+- **A lock heartbeat during the external call.** Today a lock must outlive the call, and the
+  configuration refuses a lease shorter than twice the processing delay. A call that can stall
+  needs a renewal loop instead of a bound.
 - **Replay endpoint** (`POST /events/:id/retry`) for `failed` events, which today are replayed
   by resetting their status by hand.
 - **Metrics and a correlation id**: backlog, lane utilization, lease conflicts, and an id per
