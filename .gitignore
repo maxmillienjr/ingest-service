@@ -1,0 +1,17 @@
+# build
+/dist
+/coverage
+*.tsbuildinfo
+
+# deps
+/node_modules
+
+# env
+.env
+.env.*
+!.env.example
+
+# editors / os
+.vscode/
+.idea/
+.DS_Store

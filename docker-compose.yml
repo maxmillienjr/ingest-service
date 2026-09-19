@@ -1,0 +1,43 @@
+# One image, two roles. `api` accepts events; `worker` processes them.
+# Scale processing with: docker compose up --scale worker=2
+
+x-app: &app
+  build: .
+  environment:
+    MONGO_URI: mongodb://mongo:27017/ingest
+  depends_on:
+    mongo:
+      condition: service_healthy
+  # Above SHUTDOWN_GRACE_MS so a stop lets in-flight events finish.
+  stop_grace_period: 20s
+
+services:
+  mongo:
+    image: mongo:8
+    ports:
+      - '27017:27017'
+    volumes:
+      - mongo-data:/data/db
+    healthcheck:
+      test: ['CMD', 'mongosh', '--quiet', '--eval', "db.adminCommand('ping').ok"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    <<: *app
+    environment:
+      MONGO_URI: mongodb://mongo:27017/ingest
+      ROLE: api
+      PORT: '3000'
+    ports:
+      - '3000:3000'
+
+  worker:
+    <<: *app
+    environment:
+      MONGO_URI: mongodb://mongo:27017/ingest
+      ROLE: worker
+
+volumes:
+  mongo-data:
