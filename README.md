@@ -188,6 +188,8 @@ the fencing token guarantees that only one attempt records an outcome. Exactly-o
 external system that offers no idempotency is not achievable by any client; the service passes
 the event id with every call so a system that does offer it can dedupe.
 
+**No ordering across patients.** None is needed by the conditions, and none is promised.
+
 **One image, three roles.** The accept path and the process path scale differently (one API
 instance handles the traffic comfortably, worker count follows the backlog), and a single
 switch shows that with no duplication.
@@ -206,27 +208,13 @@ and injected as a typed `ConfigService`; a bad value fails the start, not the fi
 
 _(to be written)_
 
-## Ordering and delivery semantics, in one place
-
-- Per patient, events are applied in `ts` order among the events present when the head is
-  claimed, one at a time, never concurrently, across any number of workers.
-- An event is claimable `ORDERING_GRACE_MS` after receipt. An event that arrives inside that
-  window slots into place; an event that arrives later than a successor's completion is
-  applied and flagged `outOfOrder: true`.
-- Across patients there is no ordering, and none is needed.
-- Every accepted event ends `done` or `failed`. `failed` carries the last error and the attempt
-  count and is queryable like any other status.
-- Processing is at-least-once; recording is exactly-once per event.
-
 ## Seeing it hold up
 
 `npm run load` fires events at a fixed rate with exact duplicates mixed in and each patient's
-sequence lightly shuffled, samples the backlog from `/health`, waits for the queue to drain,
-and writes `load-manifest.json`. `npm run verify` reads the manifest and the database and
-prints one line per invariant, exit code 1 on any failure.
-
-The default run (`docker compose up --build`, then `npm run load`, then `npm run verify`),
-measured locally with one api and one worker container:
+sequence lightly shuffled, samples the backlog from `/health`, and waits for the queue to
+drain. `npm run verify` checks the database against what was sent, one line per invariant,
+exit code 1 on any failure. The default run, one api and one worker container, measured
+locally:
 
 ```
 sent 3000 in 179.9s: 2711 distinct, 289 duplicates (0 got a different id), 0 rejected
@@ -242,19 +230,13 @@ PASS  backlog stayed bounded                   pending max 36, cap 250, 38 sampl
 7 passed, 0 failed
 ```
 
-Throughout the run the backlog sat at about 30 pending and 75 processing, which is the
-arithmetic of 1000 events a minute times a five-second call, with the 30 pending being the
-events inside their two-second settling window.
+The late-arrival count is the generator's own doing: with 200 patients sending round-robin, a
+shuffled event can arrive 48 seconds after its successor, far outside the settling window.
+Those events are applied and flagged rather than silently reordered, which is the flag doing
+its job on traffic harsher than the condition describes.
 
-The "late arrivals flagged" count comes from the generator's own shuffle. With 200 patients
-sending round-robin, one patient's consecutive events are 12 seconds apart, so a four-position
-displacement means an event arrives up to 48 seconds after its successor was applied, far
-outside the settling window. Those events are applied and flagged rather than silently
-reordered. That is the flag doing its job, on traffic that is deliberately worse than the
-condition describes.
-
-All knobs: `npm run load -- --rate 1000 --minutes 3 --patients 200 --dup 0.1 --shuffle 5`.
-The verifier's exclusivity check needs the worker's delay: `npm run verify -- --delay-ms 5000`.
+Knobs: `npm run load -- --rate 1000 --minutes 3 --patients 200 --dup 0.1 --shuffle 5`, and
+`npm run verify -- --delay-ms 5000` must match the worker's delay for the exclusivity check.
 
 ### Chaos recipe
 
@@ -269,52 +251,31 @@ npm run verify -- --chaos
 ```
 
 `--chaos` flips one check: reclaims are now expected, and the line reports how many events
-carry `attempts > 1`. Every other invariant must still pass. Recovery time is bounded by
-`LEASE_TTL_MS` (30 s), which is also how long a killed worker's in-flight events wait before
-another worker takes them.
+carry `attempts > 1`. Every other invariant must still pass. Recovery takes up to
+`LEASE_TTL_MS` (30 s), the time a dead worker's locks stay live.
 
-The SIGTERM variant is `docker compose stop worker` during a run. The log shows the worker
-stop claiming, finish the events it holds, release its leases, close the database, and exit 0:
+The SIGTERM variant is `docker compose stop worker` during a run. The worker stops claiming,
+finishes the events it holds, releases its leases, and exits 0:
 
 ```
 [WorkerService] worker stopped, drained 72 in-flight lane(s)
 [MongoModule] Mongo client closed
 ```
 
-Compose gives the container 20 seconds (`stop_grace_period`), above the worker's own
-`SHUTDOWN_GRACE_MS` of 15, so the drain is never cut short by the platform. Run outside a
-container, the process exits 143 instead, because Nest re-raises the signal after its hooks
-have run; as PID 1 in a container that re-raise is ignored and the exit is clean.
-
-To see failures and retries, run with `FAILURE_RATE=0.3` on the worker: about a quarter of
-a percent of events exhaust five attempts and end `failed`, which `verify` reports on its own
-line, and `attempts` on the rest shows the backoff working.
+Compose's `stop_grace_period` (20 s) sits above `SHUTDOWN_GRACE_MS` (15 s), so the platform
+never cuts the drain short. To see retries and terminal failures, set `FAILURE_RATE=0.3` on
+the worker and read the `failed` line of `verify`.
 
 ### Health
 
-`GET /health` returns `200` with the database ping, the backlog by status, and the process
-role, or `503` when the database is unreachable. A large backlog does not flip it to `503`: a
-queue that is behind is degraded, not down, and a probe that restarts a busy worker makes the
-backlog worse.
+`GET /health` returns `200` with the database ping, the backlog by status, and the role, or
+`503` when the database is unreachable. A large backlog is degraded, not down: a probe that
+restarts a busy worker only deepens it.
 
 ## Configuration
 
-All values are validated at boot; `.env.example` lists them with defaults.
-
-| Variable | Default | Meaning |
-|---|---|---|
-| `MONGO_URI` | `mongodb://localhost:27017/ingest` | Connection string |
-| `PORT` | `3000` | HTTP port |
-| `ROLE` | `both` | `api`, `worker`, or `both` |
-| `WORKER_CONCURRENCY` | `100` | Patient lanes per worker instance |
-| `PROCESSING_DELAY_MS` | `5000` | The simulated external call |
-| `FAILURE_RATE` | `0` | Probability that the simulated call throws |
-| `ORDERING_GRACE_MS` | `2000` | Settling window before an event is claimable |
-| `LEASE_TTL_MS` | `30000` | Lease and lock lifetime; bounds crash recovery time |
-| `MAX_ATTEMPTS` | `5` | Attempts before an event is marked `failed` |
-| `RETRY_BASE_MS`, `RETRY_MAX_MS` | `1000`, `60000` | Exponential backoff bounds |
-| `SHUTDOWN_GRACE_MS` | `15000` | How long SIGTERM waits for in-flight events |
-| `POLL_IDLE_MS` | `250` | Idle poll interval, backing off to 2 s |
+Every variable, its default, and what it does is in `.env.example`. All values are validated
+by a zod schema at boot, so a bad one fails the start, not the first request.
 
 ## Tests
 
@@ -324,24 +285,20 @@ All values are validated at boot; `.env.example` lists them with defaults.
 
 Covered, in order of how much would go wrong without it:
 
-- **Repository writes**: the insert dedupes and returns the existing document; the claim is
-  conditional; an expired lock is reclaimable and a live one is not; outcome, retry, and
-  failure writes all refuse a stale token; the head is held when the next event is not ready.
-- **Lease and watermark**: two workers cannot hold one patient; a stale owner cannot renew or
-  release; the watermark returns the previous value.
-- **Two workers on one database** (integration): no patient is processed by both, every
-  patient's events complete in `ts` order, a late arrival is flagged, a dead worker's leftovers
-  are recovered with `attempts: 2`, and an attempt that stalls past its lock is fenced out
-  after another worker takes over.
-- **Worker loop** with fake repositories: concurrency cap, retry backoff and give-up, blocked
-  patients skipped, shutdown drains.
-- **HTTP contract**: `202` shape, identical receipt on a retry, `400` on each validation
-  failure, `404`, `/health` `200`, and a `503` when the database is gone.
-- **Configuration**: defaults, coercion from strings, and a rejected bad value, which is a
-  failed boot.
+- **Repository writes**: the insert dedupes; the claim is conditional; an expired lock is
+  reclaimable and a live one is not; every outcome write refuses a stale token; the head is
+  held when the next event is not ready.
+- **Lease and watermark**: two workers cannot hold one patient; a stale owner cannot renew.
+- **Two workers on one database**: no patient processed by both, `ts` order kept, a late
+  arrival flagged, a dead worker's leftovers recovered with `attempts: 2`, a stalled attempt
+  fenced out after the handover.
+- **Worker loop**, with fakes: concurrency cap, backoff and give-up, blocked patients
+  skipped, shutdown drains.
+- **HTTP contract**: `202` shape, same receipt on a retry, `400` per validation rule, `404`,
+  `/health` `200` and `503`.
+- **Configuration**: defaults, coercion, and a rejected bad value.
 
-Deliberately not tested: the real five-second sleep, Terminus internals, and the load script
-itself.
+Not tested on purpose: the real five-second sleep, Terminus internals, the load script.
 
 ## With more time
 
