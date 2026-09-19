@@ -69,6 +69,11 @@ export class WorkerService
     this.retryMaxMs = config.get('RETRY_MAX_MS', { infer: true });
   }
 
+  /** What the health endpoint reports about this process. */
+  get status(): { role: Env['ROLE']; workerId: string; lanes: number } {
+    return { role: this.role, workerId: this.workerId, lanes: this.lanes.size };
+  }
+
   onApplicationBootstrap(): void {
     if (this.role === 'api') return;
     this.running = true;

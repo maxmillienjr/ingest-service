@@ -77,7 +77,27 @@ describe('/events', () => {
     });
   });
 
-  describe('GET /:id', () => {
+  describe('GET /health', () => {
+    it('reports the database, the backlog, and the role', async () => {
+      const res = await request(server).get('/health').expect(200);
+      expect(res.body).toMatchObject({
+        status: 'ok',
+        info: {
+          mongo: { status: 'up' },
+          backlog: {
+            status: 'up',
+            pending: expect.any(Number) as number,
+            processing: 0,
+            done: 0,
+            failed: 0,
+          },
+          worker: { status: 'up', role: 'api', lanes: 0 },
+        },
+      });
+    });
+  });
+
+  describe('GET /events/:id', () => {
     it('returns the stored event', async () => {
       const receipt = await request(server).post('/events').send(valid());
       const res = await request(server)

@@ -12,5 +12,6 @@ import { WorkerService } from './worker.service';
     // Swap this binding for a real integration; the worker does not change.
     { provide: EVENT_PROCESSOR, useClass: SimulatedProcessor },
   ],
+  exports: [WorkerService],
 })
 export class WorkerModule {}

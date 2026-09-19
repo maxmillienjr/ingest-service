@@ -91,6 +91,21 @@ describe('EventsRepository', () => {
     });
   });
 
+  describe('countByStatus', () => {
+    it('reports every status, including the empty ones', async () => {
+      await repo.insertIfAbsent(event());
+      await repo.insertIfAbsent(event({ _id: 'b'.repeat(64) }));
+      await repo.insertIfAbsent(event({ _id: 'c'.repeat(64), status: 'done' }));
+
+      expect(await repo.countByStatus()).toEqual({
+        pending: 2,
+        processing: 0,
+        done: 1,
+        failed: 0,
+      });
+    });
+  });
+
   describe('claimablePatients', () => {
     it('lists distinct patients with ready work, oldest work first', async () => {
       await repo.insertIfAbsent(

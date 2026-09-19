@@ -5,6 +5,7 @@ export const EVENT_STATUSES = [
   'failed',
 ] as const;
 export type EventStatus = (typeof EVENT_STATUSES)[number];
+export type StatusCounts = Record<EventStatus, number>;
 
 /**
  * One document per event. It is both the work item and the record of

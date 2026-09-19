@@ -3,7 +3,13 @@ import { Collection, Db, Filter } from 'mongodb';
 import { randomUUID } from 'node:crypto';
 import { isDuplicateKey } from '../mongo/mongo-errors';
 import { MONGO_DB } from '../mongo/mongo.tokens';
-import type { ClaimedEvent, EventDoc } from './event.types';
+import {
+  EVENT_STATUSES,
+  type ClaimedEvent,
+  type EventDoc,
+  type EventStatus,
+  type StatusCounts,
+} from './event.types';
 
 export interface Outcome {
   result: unknown;
@@ -68,6 +74,20 @@ export class EventsRepository implements OnModuleInit {
 
   findById(id: string): Promise<EventDoc | null> {
     return this.events.findOne({ _id: id });
+  }
+
+  /** How many events sit in each status. Every status is present, zero or not. */
+  async countByStatus(): Promise<StatusCounts> {
+    const rows = await this.events
+      .aggregate<{ _id: EventStatus; n: number }>([
+        { $group: { _id: '$status', n: { $sum: 1 } } },
+      ])
+      .toArray();
+    const counts = Object.fromEntries(
+      EVENT_STATUSES.map((status) => [status, 0]),
+    ) as StatusCounts;
+    for (const row of rows) counts[row._id] = row.n;
+    return counts;
   }
 
   /**

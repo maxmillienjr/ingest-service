@@ -3,6 +3,7 @@ import { ConfigModule } from '@nestjs/config';
 import { APP_PIPE } from '@nestjs/core';
 import { validateEnv, type Env } from './config/env.schema';
 import { EventsModule } from './events/events.module';
+import { HealthModule } from './health/health.module';
 import { MongoModule } from './mongo/mongo.module';
 import { WorkerModule } from './processing/worker.module';
 
@@ -20,6 +21,7 @@ import { WorkerModule } from './processing/worker.module';
     EventsModule,
     // Always mounted; whether its loop runs is decided by ROLE at bootstrap.
     WorkerModule,
+    HealthModule,
   ],
   providers: [
     {
