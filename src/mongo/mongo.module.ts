@@ -2,6 +2,7 @@ import { Inject, Logger, Module, OnApplicationShutdown } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { Db, MongoClient } from 'mongodb';
 import type { AppConfig } from '../config/env.schema';
+import { createMongoClient } from './mongo-client';
 import { MONGO_CLIENT, MONGO_DB } from './mongo.tokens';
 
 /**
@@ -15,12 +16,8 @@ import { MONGO_CLIENT, MONGO_DB } from './mongo.tokens';
       provide: MONGO_CLIENT,
       inject: [ConfigService],
       useFactory: async (config: AppConfig): Promise<MongoClient> => {
-        const client = new MongoClient(
+        const client = createMongoClient(
           config.get('MONGO_URI', { infer: true }),
-          {
-            appName: 'ingest-service',
-            serverSelectionTimeoutMS: 5_000,
-          },
         );
         // Connect eagerly: a bad URI fails the boot, not the first request.
         await client.connect();

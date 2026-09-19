@@ -1,0 +1,30 @@
+import {
+  IsISO8601,
+  IsNotEmpty,
+  IsObject,
+  IsString,
+  MaxLength,
+} from 'class-validator';
+
+/**
+ * The wire contract from the assignment. Top-level fields are strict
+ * (unknown ones are rejected by the global pipe); `data` is free-form by
+ * design, it belongs to the sender.
+ */
+export class CreateEventDto {
+  @IsString()
+  @IsNotEmpty()
+  @MaxLength(128)
+  patientId!: string;
+
+  @IsString()
+  @IsNotEmpty()
+  @MaxLength(128)
+  type!: string;
+
+  @IsObject()
+  data!: Record<string, unknown>;
+
+  @IsISO8601({ strict: true })
+  ts!: string;
+}
