@@ -14,7 +14,7 @@ npm run verify                 # checks every invariant against the database
 
 ## What the operating conditions imply
 
-The assignment lists facts about the environment, not features. This is what each one
+The requirements are facts about the environment, not features. This is what each one
 forces, what the design does about it, and where you can see it hold.
 
 | Condition | What it forces | Design answer | Where to see it |
@@ -59,7 +59,7 @@ record, all in one. There is no broker and no second store to reconcile with, so
 never counted twice" is a property of one collection's writes rather than of a dual-write
 between a queue and a database. Every state transition is a single conditional update.
 
-**A lease is not an outcome.** The assignment asks for outcomes in a single collection, and
+**A lease is not an outcome.** The requirements call for outcomes in a single collection, and
 `events` is that collection: every event's status, attempts, timing, result, and error live on
 its one document. A second collection, `patients`, holds coordination state only: which worker
 currently holds a patient, and the highest `ts` applied so far. That state is not about any

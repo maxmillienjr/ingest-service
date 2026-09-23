@@ -8,7 +8,7 @@ import {
 import { IsNotInTheFuture } from './is-not-in-the-future';
 
 /**
- * The wire contract from the assignment. Top-level fields are strict
+ * The wire contract from the requirements. Top-level fields are strict
  * (unknown ones are rejected by the global pipe); `data` is free-form by
  * design, it belongs to the sender.
  */
